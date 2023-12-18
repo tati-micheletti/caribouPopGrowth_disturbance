@@ -8,6 +8,8 @@
 
 # User-specific files
 .Ruserdata
+.Rprofile
+.github/
 
 # Example code in package build process
 *-Ex.R
@@ -31,6 +33,8 @@ vignettes/*.pdf
 # knitr and R markdown default cache directories
 *_cache/
 /cache/
+outputs/
+inputs/
 
 # Temporary files created by R markdown
 *.utf8.md
