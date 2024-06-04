@@ -21,7 +21,8 @@ defineModule(sim, list(
   timeunit = "year",
   citation = list("citation.bib"),
   documentation = list("README.md", "caribouPopGrowth_disturbance.Rmd"), ## same file
-  reqdPkgs = list("SpaDES.core (>=1.0.10)", "ggplot2", "terra", "sf", "fasterize"),
+  reqdPkgs = list("SpaDES.core (>=2.0.3.9002)","PredictiveEcology/reproducible (>= 2.0.10.9010)", 
+                  "terra", "sf", "fasterize", "tictoc", "crayon"),
   parameters = rbind(
     #defineParameter("paramName", "paramClass", value, min, max, "parameter description"),
     defineParameter(".plots", "character", "screen", NA, NA,
@@ -35,6 +36,11 @@ defineModule(sim, list(
                     "Named list of seeds to use for each event (names)."),
     defineParameter(".useCache", "logical", FALSE, NA, NA,
                     "Should caching of events or module be used?"),
+    defineParameter("saveInitialDisturbances", "logical", TRUE, NA, NA,
+                    paste0("Should the buffered disturbance be saved in the beginning? This is saved ",
+                           "to Paths[['outputPath']] as a RasterLayer, as ",
+                           " prefix 'bufferedAnthDist_' and suffix as the initial time subtracted by",
+                           " .runInterval")),
     defineParameter("disturbancesFolder", "character", Paths[["inputPath"]], NA, NA,
                     paste0("If the anthroDisturbance_Generator module is not being run, where should ",
                            "the module look for disturbance files?")),
@@ -56,7 +62,11 @@ defineModule(sim, list(
                  sourceURL = "https://drive.google.com/file/d/1v7MpENdhspkWxHPZMlmx9UPCGFYGbbYm/view?usp=sharing"),
     expectsInput(objectName = "rasterToMatch", objectClass = "RasterLayer",
                  desc = "All spatial outputs will be reprojected and resampled to it",
-                 sourceURL = "https://drive.google.com/open?id=1P4grDYDffVyVXvMjM-RwzpuH1deZuvL3")
+                 sourceURL = "https://drive.google.com/open?id=1P4grDYDffVyVXvMjM-RwzpuH1deZuvL3"),
+    expectsInput(objectName = "rstCurrentBurnList", objectClass = "list",
+                  desc = paste0("List of fires by year (SpatRaster format, named list as YearXXXX). These ",
+                                "layers are produced by landscape simulations. Need to check against ",
+                                "fireLayers, so need it here as input"))
   ),
   outputObjects = bindrows(
     createsOutput(objectName = "bufferedAnthropogenicDisturbance500m", objectClass = "RasterLayer",
@@ -68,13 +78,13 @@ defineModule(sim, list(
                                "class) of disturbances and the potential needed for ",
                                "generating disturbances.")),
     createsOutput(objectName = "rstCurrentBurnList", objectClass = "list",
-                 desc = paste0("List of fires by year (raster format). These ",
+                 desc = paste0("List of fires by year (SpatRaster format). These ",
                                "layers are produced by simulation and ",
                                "are being outputed here in case this module is being run ",
                                "post-simulation, as it needs to match the layers used for the ",
                                "disturbance generation")),
     createsOutput(objectName = "anthroDistFilePath", objectClass = "character",
-                  desc = paste0("File path of the  updated disturbance layer"))
+                  desc = paste0("File path of the updated disturbance layer"))
   )
 ))
 
@@ -87,23 +97,26 @@ doEvent.caribouPopGrowth_disturbance = function(sim, eventTime, eventType) {
     init = {
       
       if (is.null(sim$disturbanceList)){
+        #    1.2. If it doesn't exist in the sim, check if *files* it exists in a folder 
+        #    (the disturbance list per se will not exist as I am not saving it!):
+        message("disturbanceList is NULL, module will try to recover it from file")
         mod$disturbanceFromSimList <- FALSE
       } else {
+        # 1. Check if `disturbanceList` exists in sim.
+        #    1.1. If it exists --> move to next function as is.
+        #    This list is always updated in the athroDisturbance_Generator  
+        message("disturbanceList is NOT NULL, disturbance from simList will be used")
         mod$disturbanceFromSimList <- TRUE
       }
 
       # schedule future event(s)
-      sim <- scheduleEvent(sim, time(sim), "caribouPopGrowth_disturbance", "generateRstCurrentBurnList")
-      sim <- scheduleEvent(sim, time(sim), "caribouPopGrowth_disturbance", "findDisturbanceList")
-      sim <- scheduleEvent(sim, time(sim), "caribouPopGrowth_disturbance", "convertDisturbanceList")
-      sim <- scheduleEvent(sim, time(sim), "caribouPopGrowth_disturbance", "saveBufferedDisturbances")
+      sim <- scheduleEvent(sim, time(sim), "caribouPopGrowth_disturbance", "checkRstCurrentBurnList", eventPriority = 1)
+      sim <- scheduleEvent(sim, time(sim), "caribouPopGrowth_disturbance", "findDisturbanceList", eventPriority = 5)
+      sim <- scheduleEvent(sim, time(sim), "caribouPopGrowth_disturbance", "convertDisturbanceList", eventPriority = 5)
+      sim <- scheduleEvent(sim, time(sim), "caribouPopGrowth_disturbance", "saveBufferedDisturbances", eventPriority = 5)
     },
-    generateRstCurrentBurnList = {
-      # I need rstCurrentBurnList for the caribou module
-      # I should supply the same ones used for the disturbance generation! 
-      # Already generates for all years available.
-      sim$rstCurrentBurnList <- rstCurrentBurnListGenerator(Paths[["inputPath"]])
-      # Test if rstCurrentBurn align with RTM
+    checkRstCurrentBurnList = {
+
       areStackable <- tryCatch({
         invisible(raster::stack(raster::stack(sim$rstCurrentBurnList), sim$rasterToMatch))
         TRUE
@@ -126,28 +139,23 @@ doEvent.caribouPopGrowth_disturbance = function(sim, eventTime, eventType) {
                                           paste0("bufferedAnthDist_", 
                                                  P(sim)$bufferSize, 
                                                  "m_", time(sim), ".tif"))
-      
-      if (!all(file.exists(sim$anthroDistFilePath),
-              !P(sim)$overwriteDisturbanceLayer)){
-        # 1. Check if `disturbanceList` exists in sim.
-        #    1.1. If it exists --> move to next function as is.
-        #    This list is always updated in the athroDisturbance_Generator  
-        if (!mod$disturbanceFromSimList){
-          #    1.2. If it doesn't exist in the sim, check if *files* it exists in a folder 
-          #    (the disturbance list per se will not exist as I am not saving it!):
-          message(paste0("Disturbance list is not being provided by a another module. The module will",
-                         " try to find the disturbance files and create it."))
-          sim$disturbanceList <- getDisturbanceList(disturbancesFolder = P(sim)$disturbancesFolder,
-                                                    disturbanceNamingPattern = P(sim)$disturbanceNamingPattern,
-                                                    currentYear = time(sim))
-          #    1.3. If it exists: load all layers exactly as in the `disturbanceList`
+        if (!all(file.exists(sim$anthroDistFilePath),
+                 !P(sim)$overwriteDisturbanceLayer)){
+          if (!mod$disturbanceFromSimList){
+            #    1.2. If it doesn't exist in the sim, check if *files* it exists in a folder 
+            #    (the disturbance list per se will not exist as I am not saving it!):
+            message(paste0("Disturbance list is not being provided by a another module for year ",time(sim),
+                           ". The module will try to find the disturbance files and create it."))
+            sim$disturbanceList <- getDisturbanceList(disturbancesFolder = P(sim)$disturbancesFolder,
+                                                      disturbanceNamingPattern = P(sim)$disturbanceNamingPattern,
+                                                      currentYear = time(sim))
+            #    1.3. If it exists: load all layers exactly as in the `disturbanceList`
+          }
+          if (is.null(sim$disturbanceList)){
+            #        1.2.1. If disturbanceList still doesn't exist there is no point in runing the module! 
+            stop("disturbanceList was not found nor provided. There is no reason to run the module.")
+          }
         }
-        if (is.null(sim$disturbanceList)){
-          #        1.2.1. If disturbanceList still doesn't exist there is no point in runing the module! 
-          stop("disturbanceList was not found nor provided. There is no reason to run the module.")
-        }
-      }
-    
       sim <- scheduleEvent(sim, time(sim) + P(sim)$.runInterval, "caribouPopGrowth_disturbance", "findDisturbanceList")
 
     },
@@ -162,7 +170,9 @@ doEvent.caribouPopGrowth_disturbance = function(sim, eventTime, eventType) {
       sim$bufferedAnthropogenicDisturbance500m <- createBufferedDisturbances(disturbanceList = sim$disturbanceList,
                                                                              bufferSize = P(sim)$bufferSize,
                                                                              rasterToMatch = sim$rasterToMatch,
-                                                                             studyArea = sim$studyArea)
+                                                                             studyArea = sim$studyArea,
+                                                                             currentTime = time(sim),
+                                                                             convertToRaster = TRUE)
       }
       sim <- scheduleEvent(sim, time(sim) + P(sim)$.runInterval, "caribouPopGrowth_disturbance", "convertDisturbanceList")
       
@@ -170,14 +180,13 @@ doEvent.caribouPopGrowth_disturbance = function(sim, eventTime, eventType) {
     saveBufferedDisturbances = {
       if (!all(file.exists(sim$anthroDistFilePath),
                !P(sim)$overwriteDisturbanceLayer)){
-        writeRaster(sim$bufferedAnthropogenicDisturbance500m, 
+        terra::writeRaster(sim$bufferedAnthropogenicDisturbance500m, 
                   filename = sim$anthroDistFilePath,
-                  format = "GTiff",
                   overwrite = TRUE)
       } else {
         message(crayon::red(paste0("bufferedAnthropogenicDisturbance500m found for year ", time(sim), " and ",
                        "overwriteDisturbanceLayer is FALSE. Loading existing file.")))
-        sim$bufferedAnthropogenicDisturbance500m <- raster::raster(sim$anthroDistFilePath)
+        sim$bufferedAnthropogenicDisturbance500m <- terra::rast(sim$anthroDistFilePath)
       }
       sim <- scheduleEvent(sim, time(sim) + P(sim)$.runInterval, "caribouPopGrowth_disturbance", 
                            "saveBufferedDisturbances")
@@ -203,6 +212,16 @@ doEvent.caribouPopGrowth_disturbance = function(sim, eventTime, eventType) {
                                destinationPath = dPath,
                                overwrite = TRUE,
                                omitArgs = c("destinationPath", "overwrite", "filename2"))
+  }
+
+  if (!suppliedElsewhere("rstCurrentBurnList", sim)) { # Work around until SpaDES.core is fixed!
+    # I need rstCurrentBurnList for the caribou module
+    # I should supply the same ones used for the disturbance generation! 
+    # Already generates for all years available. Needs to be this way 
+    # because the caribou module needs all disturbances in the last X years and 
+    # in the simulations, rstCurrentBurn is saved for each year, but is NOT 
+    # in the simList
+    sim$rstCurrentBurnList <- rstCurrentBurnListGenerator(Paths[["outputPath"]])      # Test if rstCurrentBurn align with RTM
   }
   
   return(invisible(sim))
